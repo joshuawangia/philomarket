@@ -1,4 +1,6 @@
 export const MARKET_LIQUIDITY = 10000;
+// Upper bound on a single trade request; far above any reachable balance.
+export const MAX_TRADE_POINTS = 1_000_000;
 
 export function roundPoints(value) {
   return Math.round((value + Number.EPSILON) * 100) / 100;
@@ -10,6 +12,16 @@ export function floorPoints(value) {
 
 export function roundShares(value) {
   return Math.round((value + Number.EPSILON) * 1e8) / 1e8;
+}
+
+// Parses a request's point amount. Only a JSON number in whole cents from 0.01
+// to MAX_TRADE_POINTS is accepted: Number(true) === 1 and Number('0x10') === 16
+// must not turn into trades. Returns null when invalid.
+export function parsePointAmount(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  if (value < 0.01 || value > MAX_TRADE_POINTS) return null;
+  const amount = roundPoints(value);
+  return Math.abs(value - amount) > 1e-8 ? null : amount;
 }
 
 export function marketProbabilities(outcomes, liquidity = MARKET_LIQUIDITY) {

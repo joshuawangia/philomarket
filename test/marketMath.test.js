@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as marketMath from '../marketMath.js';
 import {
   MARKET_LIQUIDITY,
   floorPoints,
   marketProbabilities,
+  roundPoints,
   proceedsForSale,
   roundShares,
   sharesForSaleAmount,
@@ -182,4 +184,95 @@ test('liquidity sanity: a 500-point account moves a 2-outcome price by ~2.4 poin
   buy(outcomes, 0, 500);
   const price = marketProbabilities(outcomes, MARKET_LIQUIDITY)[0];
   assert.ok(price > 0.52 && price < 0.53, `price ${price}`);
+});
+
+// Server-faithful replay of api/markets/[id]/back.js + sell.js accounting:
+// pointPool = sum of spends minus payouts (roundPoints), and a sale is capped
+// at floorPoints(min(quote, pointPool)) exactly as sell.js does.
+function simulateMarket(outcomeCount) {
+  const outcomes = freshMarket(outcomeCount);
+  let pointPool = 0;
+  return {
+    outcomes,
+    get pointPool() { return pointPool; },
+    back(index, amount) {
+      const shares = buy(outcomes, index, amount);
+      pointPool = roundPoints(pointPool + amount);
+      return shares;
+    },
+    // Returns { quote, cap, paid, sold } for a request of `amount` (default: everything).
+    sell(index, heldShares, amount) {
+      const quote = floorPoints(proceedsForSale(outcomes, index, heldShares));
+      const cap = floorPoints(Math.min(proceedsForSale(outcomes, index, heldShares), pointPool));
+      const requested = amount ?? cap;
+      if (requested > cap || requested < 0.01) return { quote, cap, paid: 0, sold: 0 };
+      const sold = sharesForSaleAmount(outcomes, index, requested, heldShares);
+      const paid = Math.min(requested, floorPoints(proceedsForSale(outcomes, index, sold)));
+      sell(outcomes, index, sold);
+      pointPool = Math.max(0, roundPoints(pointPool - paid));
+      return { quote, cap, paid, sold };
+    },
+  };
+}
+
+test('pointPool cap never binds: B and C take profit before A exits', () => {
+  const market = simulateMarket(2);
+  const a = market.back(0, 50);
+  const b = market.back(0, 200);
+  const c = market.back(0, 200);
+  assert.equal(market.pointPool, 450);
+  const exits = [['B', b], ['C', c], ['A', a]].map(([name, shares]) => {
+    const result = market.sell(0, shares);
+    assert.equal(result.cap, result.quote, `${name}: pool cap ${result.cap} < quote ${result.quote}`);
+    assert.equal(result.paid, result.quote, `${name} paid ${result.paid}, quote ${result.quote}`);
+    assert.equal(result.sold, shares, `${name} left shares behind`);
+    return result.paid;
+  });
+  // B entered after A and exits first at a profit; C and A get what is left of the curve.
+  assert.deepEqual(exits, [203.8, 196.19, 50]);
+  assert.ok(market.pointPool >= 0 && market.pointPool < 0.05, `pool residue ${market.pointPool}`);
+  assert.equal(market.outcomes[0].shares, 0);
+});
+
+test('pointPool cap never binds: seeded random back/sell sequences', () => {
+  const random = rng(7);
+  let sales = 0;
+  for (let trial = 0; trial < 1500; trial += 1) {
+    const count = 2 + Math.floor(random() * 10);
+    const market = simulateMarket(count);
+    const holdings = [];
+    const steps = 5 + Math.floor(random() * 40);
+    const trySell = (holding, amount) => {
+      const result = market.sell(holding.index, holding.shares, amount);
+      assert.equal(result.cap, result.quote, `trial ${trial}: cap ${result.cap} < quote ${result.quote}`);
+      holding.shares = roundShares(holding.shares - result.sold);
+      sales += 1;
+    };
+    for (let step = 0; step < steps; step += 1) {
+      const open = holdings.filter((holding) => holding.shares > 0);
+      if (open.length && random() < 0.45) {
+        const holding = open[Math.floor(random() * open.length)];
+        const full = floorPoints(proceedsForSale(market.outcomes, holding.index, holding.shares));
+        trySell(holding, random() < 0.6 ? undefined : Math.max(0.01, floorPoints(full * random())));
+      } else {
+        const index = Math.floor(random() * count);
+        const amount = (1 + Math.floor(random() * 50000)) / 100;
+        holdings.push({ index, shares: market.back(index, amount) });
+      }
+    }
+    for (const holding of holdings.filter((item) => item.shares > 0)) trySell(holding);
+    assert.ok(market.pointPool >= 0, `trial ${trial}: pool went negative`);
+  }
+  assert.ok(sales > 10000, `only ${sales} sales exercised`);
+});
+
+test('parsePointAmount: request amounts must be real numbers in cents within bounds', () => {
+  const { parsePointAmount, MAX_TRADE_POINTS } = marketMath;
+  assert.equal(typeof parsePointAmount, 'function', 'marketMath must export parsePointAmount');
+  assert.ok(Number.isFinite(MAX_TRADE_POINTS) && MAX_TRADE_POINTS > 0);
+  for (const good of [0.01, 1, 50.98, 500, MAX_TRADE_POINTS]) assert.equal(parsePointAmount(good), good);
+  for (const bad of [true, false, '16', '0x10', '50', null, undefined, {}, [5], NaN, Infinity, -1, 0, 0.001, 1.005,
+    MAX_TRADE_POINTS + 0.01, 1e300]) {
+    assert.equal(parsePointAmount(bad), null, `accepted ${JSON.stringify(bad)}`);
+  }
 });

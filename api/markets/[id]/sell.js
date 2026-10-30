@@ -1,6 +1,6 @@
 import { getAdminServices } from '../../../server/firebaseAdmin.js';
 import { handleApiError, methodNotAllowed, profileFrom, readJson, requireVerifiedUser, sendJson } from '../../../server/http.js';
-import { appendPriceHistory, floorPoints, MARKET_LIQUIDITY, proceedsForSale, roundPoints, roundShares, sharesForSaleAmount } from '../../../marketMath.js';
+import { appendPriceHistory, floorPoints, MARKET_LIQUIDITY, parsePointAmount, proceedsForSale, roundPoints, roundShares, sharesForSaleAmount } from '../../../marketMath.js';
 import { enforceTradeCooldown, readAccountContext, writeAccountContext } from '../../../server/accounts.js';
 
 function validMarketId(value) {
@@ -32,11 +32,10 @@ export default async function handler(req, res) {
     // `all: true` sells the whole position at the server's current quote, so a
     // client holding a stale market snapshot can still exit at today's price.
     const sellAll = body?.all === true;
-    const rawAmount = Number(body?.amount);
-    const requestedAmount = roundPoints(rawAmount);
+    const requestedAmount = parsePointAmount(body?.amount);
     const marketId = req.query?.id;
     const outcomeId = typeof body?.outcomeId === 'string' ? body.outcomeId : '';
-    if (!sellAll && (!Number.isFinite(rawAmount) || rawAmount < 0.01 || Math.abs(rawAmount - requestedAmount) > 1e-8)) {
+    if (!sellAll && requestedAmount === null) {
       throw Object.assign(new Error('Enter the point amount you want to sell from this pick.'), { status: 400 });
     }
     if (!validMarketId(marketId)) throw Object.assign(new Error('Market not found.'), { status: 404 });
