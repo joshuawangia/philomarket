@@ -81,6 +81,10 @@ if (!canMockModules) {
     'tok-admin': { uid: 'admin', email: 'boss@club.org', email_verified: true },
   };
   let db;
+  // The hardening branch makes an empty allow-list fail closed (503) outside
+  // `vercel dev`, so the handler fixtures declare the three test mailboxes
+  // explicitly, the way production should.
+  process.env.PHILOMARKET_ALLOWED_EMAILS = Object.values(users).map((u) => u.email).join(',');
   const auth = {
     verifyIdToken: async (token) => { if (!users[token]) throw new Error('bad'); return users[token]; },
     getUsers: async (ids) => ({
