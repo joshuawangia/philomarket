@@ -418,6 +418,12 @@ function render() {
   renderMarketDetail();
 }
 
+// One key per trade click: the server returns the original result for a
+// replayed key instead of trading twice.
+function tradeRequestKey() {
+  return globalThis.crypto?.randomUUID?.() || `k-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 async function requestApi(path, options = {}) {
   const { auth = true, headers: requestHeaders, ...requestOptions } = options;
   const headers = { 'Content-Type': 'application/json', ...requestHeaders };
@@ -775,6 +781,7 @@ async function backOutcome(outcomeId) {
   try {
     const result = await requestApi(`/api/markets/${encodeURIComponent(market.id)}/back`, {
       method: 'POST',
+      headers: { 'Idempotency-Key': tradeRequestKey() },
       body: JSON.stringify({ outcomeId, amount: state.stake }),
     });
     state.profile = result.profile;
@@ -801,6 +808,7 @@ async function sellOutcome(outcomeId, amount, all = false) {
   try {
     const result = await requestApi(`/api/markets/${encodeURIComponent(market.id)}/sell`, {
       method: 'POST',
+      headers: { 'Idempotency-Key': tradeRequestKey() },
       body: JSON.stringify(all ? { outcomeId, all: true } : { outcomeId, amount }),
     });
     state.profile = result.profile;
