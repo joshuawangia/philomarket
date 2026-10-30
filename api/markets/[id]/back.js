@@ -75,10 +75,20 @@ export default async function handler(req, res) {
         throw Object.assign(new Error('The current market quote is unavailable. Refresh and try again.'), { status: 409 });
       }
       outcomes[outcomeIndex] = { ...outcomes[outcomeIndex], shares: roundShares(outcomes[outcomeIndex].shares + sharesBought) };
-      const existingPosition = positionSnapshot.exists ? positionSnapshot.data().sharesByOutcome || {} : {};
+      const positionData = positionSnapshot.exists ? positionSnapshot.data() : {};
+      const existingPosition = positionData.sharesByOutcome || {};
       const position = {
         ...existingPosition,
         [outcomeId]: roundShares((Number(existingPosition[outcomeId]) || 0) + sharesBought),
+      };
+      const existingCostBasis = positionData.costBasisByOutcome || {};
+      const priorCostBasis = existingCostBasis[outcomeId];
+      const hasKnownBasis = typeof priorCostBasis === 'number' && Number.isFinite(priorCostBasis) && priorCostBasis >= 0;
+      const costBasis = {
+        ...existingCostBasis,
+        [outcomeId]: Number(existingPosition[outcomeId]) > 0 && !hasKnownBasis
+          ? null
+          : roundPoints((hasKnownBasis ? priorCostBasis : 0) + amount),
       };
       const hasBackedBefore = positionSnapshot.exists && positionSnapshot.data().hasBacked === true;
       const updatedUser = { ...userData, points: roundPoints(userData.points - amount) };
@@ -109,6 +119,7 @@ export default async function handler(req, res) {
       transaction.set(positionRef, {
         uid: decoded.uid,
         sharesByOutcome: position,
+        costBasisByOutcome: costBasis,
         hasBacked: true,
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
@@ -117,6 +128,7 @@ export default async function handler(req, res) {
         profile: profileFrom(decoded.uid, decoded.email || '', updatedUser),
         market: presentMarket(marketId, updatedMarket, decoded.uid),
         position,
+        costBasis,
       };
     });
 

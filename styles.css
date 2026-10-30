@@ -158,8 +158,10 @@ button { cursor: pointer; }
 .outcome-row:last-child { border-bottom: 0; }
 .outcome-row:hover { background: #192a35; }
 .outcome-identity { display: flex; align-items: center; min-width: 0; gap: 10px; }
+.outcome-identity-details { display: grid; min-width: 0; gap: 3px; }
 .outcome-badge { display: grid; width: 27px; height: 27px; flex: 0 0 auto; place-items: center; border-radius: 5px; color: #f2f5f5; background: var(--badge-color); font-size: 8px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .outcome-name { overflow: hidden; color: #e2e9ec; font-size: 11px; font-weight: 580; text-overflow: ellipsis; white-space: nowrap; }
+.outcome-investment { color: #82949c; font-size: 10px; font-variant-numeric: tabular-nums; }
 .outcome-chance { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .chance-pill { color: #c0f0dc; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.035em; }
 .chance-track { display: block; width: 100%; height: 3px; overflow: hidden; border-radius: 3px; background: #283a44; }

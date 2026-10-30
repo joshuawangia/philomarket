@@ -70,7 +70,9 @@ export default async function handler(req, res) {
         ...outcome,
         shares: Math.max(0, Number(outcome.shares) || 0),
       }));
-      const position = positionSnapshot.data().sharesByOutcome || {};
+      const positionData = positionSnapshot.data();
+      const position = positionData.sharesByOutcome || {};
+      const costBasis = { ...(positionData.costBasisByOutcome || {}) };
       const liquidity = marketData.liquidity || MARKET_LIQUIDITY;
       const pointPool = roundPoints(Math.max(0, Number(marketData.pointPool) || 0));
       const updatedPosition = { ...position };
@@ -98,7 +100,16 @@ export default async function handler(req, res) {
         shares: Math.max(0, roundShares(outcomes[outcomeIndex].shares - soldShares)),
       };
       const remainingShares = Math.max(0, roundShares(availableShares - soldShares));
-      updatedPosition[outcomeId] = remainingShares < 1e-8 ? 0 : remainingShares;
+      if (remainingShares < 1e-8) {
+        updatedPosition[outcomeId] = 0;
+        costBasis[outcomeId] = 0;
+      } else {
+        updatedPosition[outcomeId] = remainingShares;
+        const priorCostBasis = costBasis[outcomeId];
+        costBasis[outcomeId] = typeof priorCostBasis === 'number' && Number.isFinite(priorCostBasis) && priorCostBasis >= 0
+          ? roundPoints(priorCostBasis * remainingShares / availableShares)
+          : null;
+      }
 
       const updatedUser = { ...userData, points: roundPoints(userData.points + proceeds) };
       const updatedMarket = {
@@ -125,6 +136,7 @@ export default async function handler(req, res) {
       });
       transaction.set(positionRef, {
         sharesByOutcome: updatedPosition,
+        costBasisByOutcome: costBasis,
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
 
@@ -132,6 +144,7 @@ export default async function handler(req, res) {
         profile: profileFrom(decoded.uid, decoded.email || '', updatedUser),
         market: presentMarket(marketId, updatedMarket, decoded.uid),
         position: updatedPosition,
+        costBasis,
         proceeds,
         soldShares: roundShares(soldShares),
         outcomeId,

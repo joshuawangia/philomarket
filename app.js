@@ -99,6 +99,7 @@ const state = {
   profile: null,
   user: null,
   position: {},
+  costBasis: {},
   priceHistory: [],
   priceHistoryMarketId: '',
   authMode: 'signin',
@@ -181,7 +182,10 @@ function filteredMarkets() {
 
   if (state.sort === 'newest') results = results.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   else if (state.sort === 'alphabetical') results = results.sort((a, b) => a.question.localeCompare(b.question));
-  else results = results.sort((a, b) => (b.pointPool || 0) - (a.pointPool || 0) || b.createdAt.localeCompare(a.createdAt));
+  else results = results.sort((a, b) =>
+    (Number(b.liquidityReserve) || 0) - (Number(a.liquidityReserve) || 0) ||
+    (Number(b.pointPool) || 0) - (Number(a.pointPool) || 0) ||
+    b.createdAt.localeCompare(a.createdAt));
   return results;
 }
 
@@ -399,12 +403,22 @@ function renderMarketDetail() {
 
   market.outcomes.forEach((outcome, index) => {
     const chance = marketChance(market, outcome);
+    const heldShares = Number(state.position[outcome.id]) || 0;
     const row = element('li', 'outcome-row');
     const outcomeIdentity = element('div', 'outcome-identity');
     const badge = element('span', 'outcome-badge', String(index + 1).padStart(2, '0'));
     badge.style.setProperty('--badge-color', initialColors[index % initialColors.length]);
     const name = element('span', 'outcome-name', outcome.label);
-    outcomeIdentity.append(badge, name);
+    const identityDetails = element('div', 'outcome-identity-details');
+    identityDetails.append(name);
+    if (state.profile && heldShares > 0) {
+      const basis = state.costBasis[outcome.id];
+      const buyIn = typeof basis === 'number' && Number.isFinite(basis)
+        ? `Bought in for ${formatPoints(basis)}`
+        : 'Buy-in unavailable for this older position';
+      identityDetails.append(element('small', 'outcome-investment', buyIn));
+    }
+    outcomeIdentity.append(badge, identityDetails);
 
     const chanceCell = element('div', 'outcome-chance');
     chanceCell.append(element('strong', 'chance-pill', `$${(chance / 100).toFixed(2)}`));
@@ -425,7 +439,6 @@ function renderMarketDetail() {
     backButton.disabled = !validStake || setupMissing || market.status !== 'open' || (state.profile && balance < state.stake);
     actions.append(backButton);
 
-    const heldShares = Number(state.position[outcome.id]) || 0;
     if (state.profile && heldShares > 0) {
       const quote = proceedsForSale(market.outcomes, index, heldShares, market.liquidity || MARKET_LIQUIDITY);
       const estimate = floorPoints(Math.min(quote, Number(market.pointPool) || 0));
@@ -481,6 +494,7 @@ async function refreshSelectedMarketData() {
   const market = state.markets.find((item) => item.id === marketId);
   if (!marketId || !market) {
     state.position = {};
+    state.costBasis = {};
     state.priceHistory = [];
     state.priceHistoryMarketId = '';
     renderMarketDetail();
@@ -489,7 +503,7 @@ async function refreshSelectedMarketData() {
   const historyRequest = requestApi(`/api/markets/${encodeURIComponent(marketId)}/history`, { auth: false });
   const positionRequest = state.profile && !previewMode
     ? requestApi(`/api/markets/${encodeURIComponent(marketId)}/position`)
-    : Promise.resolve({ position: {} });
+    : Promise.resolve({ position: {}, costBasis: {} });
   const [historyResult, positionResult] = await Promise.allSettled([historyRequest, positionRequest]);
   if (marketId !== state.selectedId) return;
   state.priceHistoryMarketId = marketId;
@@ -497,6 +511,7 @@ async function refreshSelectedMarketData() {
     ? historyResult.value.priceHistory || []
     : market.priceHistory || [];
   state.position = positionResult.status === 'fulfilled' ? positionResult.value.position || {} : {};
+  state.costBasis = positionResult.status === 'fulfilled' ? positionResult.value.costBasis || {} : {};
   if (positionResult.status === 'rejected' && state.profile) state.marketError = positionResult.reason.message;
   renderMarketDetail();
 }
@@ -579,9 +594,11 @@ function resetAuthDialog() {
 async function loadProfile(user) {
   state.user = user;
   state.position = {};
+  state.costBasis = {};
   if (!user || !user.emailVerified) {
     state.profile = null;
     state.position = {};
+    state.costBasis = {};
     render();
     return;
   }
@@ -768,6 +785,8 @@ async function submitMarket(event) {
       state.markets.unshift(market);
       state.position = result.position || {};
     }
+    state.position = {};
+    state.costBasis = {};
     state.selectedId = market.id;
     state.priceHistoryMarketId = market.id;
     state.priceHistory = market.priceHistory || [];
@@ -804,6 +823,7 @@ async function backOutcome(outcomeId) {
     state.profile = result.profile;
     state.markets = state.markets.map((item) => item.id === market.id ? result.market : item);
     state.position = result.position || {};
+    state.costBasis = result.costBasis || {};
     state.priceHistoryMarketId = market.id;
     state.priceHistory = result.market.priceHistory || [];
     render();
@@ -829,6 +849,7 @@ async function sellOutcome(outcomeId, amount) {
     state.profile = result.profile;
     state.markets = state.markets.map((item) => item.id === market.id ? result.market : item);
     state.position = result.position || {};
+    state.costBasis = result.costBasis || {};
     state.priceHistoryMarketId = market.id;
     state.priceHistory = result.market.priceHistory || [];
     render();
@@ -843,6 +864,7 @@ el.marketList.addEventListener('click', (event) => {
   if (!button) return;
   state.selectedId = button.dataset.marketId;
   state.position = {};
+  state.costBasis = {};
   state.priceHistory = [];
   state.priceHistoryMarketId = state.selectedId;
   render();
@@ -889,6 +911,7 @@ el.signOutButton.addEventListener('click', async () => {
     state.user = null;
     state.profile = null;
     state.position = {};
+    state.costBasis = {};
     render();
     showToast('Signed out.');
   } catch { showToast('Could not sign out right now.'); }
@@ -921,6 +944,7 @@ if (auth) {
       state.user = null;
       state.profile = null;
       state.position = {};
+      state.costBasis = {};
       render();
       return;
     }
@@ -928,6 +952,7 @@ if (auth) {
     if (!user.emailVerified) {
       state.profile = null;
       state.position = {};
+      state.costBasis = {};
       render();
       return;
     }

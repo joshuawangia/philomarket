@@ -23,6 +23,7 @@ function presentMarket(snapshot, currentUid = null) {
     question: data.question,
     outcomes: data.outcomes,
     liquidity: data.liquidity || MARKET_LIQUIDITY,
+    liquidityReserve: Number(data.liquidityReserve) || 0,
     pointPool: data.pointPool || 0,
     backCount: data.backCount || 0,
     sellCount: data.sellCount || 0,
@@ -117,6 +118,8 @@ export default async function handler(req, res) {
         if (defaultMarket.exists) marketDocs = [...marketDocs.slice(0, MAX_MARKETS_RETURNED - 1), defaultMarket];
       }
       const markets = marketDocs.map((doc) => presentMarket(doc, currentUid)).sort((a, b) => {
+        const liquidity = (Number(b.liquidityReserve) || 0) - (Number(a.liquidityReserve) || 0);
+        if (liquidity) return liquidity;
         const activity = b.pointPool - a.pointPool;
         return activity || b.createdAt.localeCompare(a.createdAt);
       });

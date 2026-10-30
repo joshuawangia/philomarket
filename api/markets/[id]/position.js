@@ -15,8 +15,10 @@ export default async function handler(req, res) {
     const positionRef = marketRef.collection('positions').doc(decoded.uid);
     const [marketSnapshot, positionSnapshot] = await Promise.all([marketRef.get(), positionRef.get()]);
     if (!marketSnapshot.exists) throw Object.assign(new Error('Market not found.'), { status: 404 });
+    const positionData = positionSnapshot.exists ? positionSnapshot.data() : {};
     return sendJson(res, 200, {
-      position: positionSnapshot.exists ? positionSnapshot.data().sharesByOutcome || {} : {},
+      position: positionData.sharesByOutcome || {},
+      costBasis: positionData.costBasisByOutcome || {},
     });
   } catch (error) {
     return handleApiError(res, error);
