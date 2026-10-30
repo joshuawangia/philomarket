@@ -1,6 +1,6 @@
 import { getAdminServices } from '../../../server/firebaseAdmin.js';
 import { handleApiError, methodNotAllowed, profileFrom, readJson, requireVerifiedUser, sendJson } from '../../../server/http.js';
-import { appendPriceHistory, floorPoints, MARKET_LIQUIDITY, proceedsForSale, roundPoints, roundShares } from '../../../marketMath.js';
+import { appendPriceHistory, floorPoints, MARKET_LIQUIDITY, proceedsForSale, roundPoints, roundShares, sharesForSaleAmount } from '../../../marketMath.js';
 import { enforceTradeCooldown, readAccountContext, writeAccountContext } from '../../../server/accounts.js';
 
 function validMarketId(value) {
@@ -29,8 +29,13 @@ export default async function handler(req, res) {
   try {
     const decoded = await requireVerifiedUser(req);
     const body = await readJson(req);
+    const rawAmount = Number(body?.amount);
+    const amount = roundPoints(rawAmount);
     const marketId = req.query?.id;
     const outcomeId = typeof body?.outcomeId === 'string' ? body.outcomeId : '';
+    if (!Number.isFinite(rawAmount) || rawAmount < 0.01 || Math.abs(rawAmount - amount) > 1e-8) {
+      throw Object.assign(new Error('Enter the point amount you want to sell from this pick.'), { status: 400 });
+    }
     if (!validMarketId(marketId)) throw Object.assign(new Error('Market not found.'), { status: 404 });
     if (!outcomeId || outcomeId.length > 80) {
       throw Object.assign(new Error('Choose an outcome before selling it.'), { status: 400 });
@@ -67,30 +72,40 @@ export default async function handler(req, res) {
       }));
       const position = positionSnapshot.data().sharesByOutcome || {};
       const liquidity = marketData.liquidity || MARKET_LIQUIDITY;
+      const pointPool = roundPoints(Math.max(0, Number(marketData.pointPool) || 0));
       const updatedPosition = { ...position };
       const outcomeIndex = outcomes.findIndex((outcome) => outcome.id === outcomeId);
-      const soldShares = Number(position[outcomeId]) || 0;
+      const availableShares = Number(position[outcomeId]) || 0;
       if (outcomeIndex < 0) throw Object.assign(new Error('That outcome is not in this market.'), { status: 400 });
-      if (soldShares <= 0) throw Object.assign(new Error('You do not have a position to sell.'), { status: 409 });
-      if (soldShares > outcomes[outcomeIndex].shares + 1e-7) {
+      if (availableShares <= 0) throw Object.assign(new Error('You do not have a position to sell.'), { status: 409 });
+      if (availableShares > outcomes[outcomeIndex].shares + 1e-7) {
         throw Object.assign(new Error('Your position needs a refresh before it can be sold.'), { status: 409 });
       }
-      const proceeds = floorPoints(proceedsForSale(outcomes, outcomeIndex, soldShares, liquidity));
-      if (proceeds < 0.01) {
-        throw Object.assign(new Error('This position is too small to sell for a point amount.'), { status: 409 });
+      const maxProceeds = floorPoints(Math.min(
+        proceedsForSale(outcomes, outcomeIndex, availableShares, liquidity),
+        pointPool,
+      ));
+      if (amount > maxProceeds) {
+        throw Object.assign(new Error(`This pick can currently sell for at most ${maxProceeds} points.`), { status: 409 });
       }
+      const soldShares = sharesForSaleAmount(outcomes, outcomeIndex, amount, availableShares, liquidity);
+      if (soldShares <= 0) throw Object.assign(new Error('This position is too small to sell for that amount.'), { status: 409 });
+      const proceeds = Math.min(amount, floorPoints(proceedsForSale(outcomes, outcomeIndex, soldShares, liquidity)));
+      if (proceeds < amount) throw Object.assign(new Error('The quote changed. Refresh and try again.'), { status: 409 });
+
       outcomes[outcomeIndex] = {
         ...outcomes[outcomeIndex],
         shares: Math.max(0, roundShares(outcomes[outcomeIndex].shares - soldShares)),
       };
-      updatedPosition[outcomeId] = 0;
+      const remainingShares = Math.max(0, roundShares(availableShares - soldShares));
+      updatedPosition[outcomeId] = remainingShares < 1e-8 ? 0 : remainingShares;
 
       const updatedUser = { ...userData, points: roundPoints(userData.points + proceeds) };
       const updatedMarket = {
         ...marketData,
         outcomes,
         liquidity,
-        pointPool: Math.max(0, roundPoints((marketData.pointPool || 0) - proceeds)),
+        pointPool: Math.max(0, roundPoints(pointPool - proceeds)),
         sellCount: (marketData.sellCount || 0) + 1,
         priceHistory: appendPriceHistory(marketData.priceHistory, outcomes, liquidity),
         updatedAt: FieldValue.serverTimestamp(),

@@ -55,3 +55,24 @@ export function proceedsForSale(outcomes, outcomeIndex, shares, liquidity = MARK
   }));
   return Math.max(0, marketCost(outcomes, liquidity) - marketCost(reduced, liquidity));
 }
+
+
+export function sharesForSaleAmount(outcomes, outcomeIndex, amount, availableShares, liquidity = MARKET_LIQUIDITY) {
+  if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(availableShares) || availableShares <= 0) return 0;
+  if (!Number.isFinite(liquidity) || liquidity <= 0 || !outcomes?.[outcomeIndex]) return 0;
+
+  const maxShares = Math.min(availableShares, Math.max(0, Number(outcomes[outcomeIndex].shares) || 0));
+  if (maxShares <= 0 || floorPoints(proceedsForSale(outcomes, outcomeIndex, maxShares, liquidity)) < amount) return 0;
+
+  let low = 0;
+  let high = maxShares;
+  for (let iteration = 0; iteration < 80; iteration += 1) {
+    const midpoint = (low + high) / 2;
+    const quote = floorPoints(proceedsForSale(outcomes, outcomeIndex, midpoint, liquidity));
+    if (quote >= amount) high = midpoint;
+    else low = midpoint;
+  }
+
+  // Round upward by one share tick so rounding cannot leave the quote a cent short.
+  return Math.min(maxShares, roundShares(high + 1e-8));
+}

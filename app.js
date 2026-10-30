@@ -246,6 +246,14 @@ function updateStakeControls() {
     button.setAttribute('aria-label', `${actionLabel()} on ${button.dataset.outcomeLabel}`);
     button.disabled = !valid || setupMissing || market?.status !== 'open' || (state.profile && balance < state.stake);
   });
+  el.marketDetail.querySelectorAll('.sell-button').forEach((button) => {
+    const maxSellPoints = Number(button.dataset.maxSellPoints) || 0;
+    const sellAmount = valid ? Math.min(state.stake, maxSellPoints) : 0;
+    button.dataset.sellAmount = String(sellAmount);
+    button.textContent = sellAmount > 0 ? `Sell ${formatPoints(sellAmount)}` : 'Choose amount';
+    button.setAttribute('aria-label', `Sell ${formatPoints(sellAmount)} worth of ${button.dataset.outcomeLabel} at the current market price. Maximum available: ${formatPoints(maxSellPoints)}.`);
+    button.disabled = !valid || market?.status !== 'open' || sellAmount < 0.01;
+  });
 }
 
 function renderPriceChart(market) {
@@ -323,10 +331,17 @@ function renderMarketDetail() {
   }
 
   const balance = currentBalance();
-  const stakeLimit = balance ?? INITIAL_POINTS;
-  if (!Number.isFinite(stakeLimit) || stakeLimit <= 0) state.stake = null;
-  else if (!Number.isFinite(state.stake) || state.stake <= 0) state.stake = Math.min(10, stakeLimit);
-  else state.stake = Math.min(state.stake, stakeLimit);
+  const spendLimit = balance ?? INITIAL_POINTS;
+  const maxSaleAmount = market.outcomes.reduce((max, outcome, index) => {
+    const heldShares = Number(state.position[outcome.id]) || 0;
+    if (heldShares <= 0) return max;
+    const quote = proceedsForSale(market.outcomes, index, heldShares, market.liquidity || MARKET_LIQUIDITY);
+    return Math.max(max, floorPoints(Math.min(quote, Number(market.pointPool) || 0)));
+  }, 0);
+  const amountLimit = Math.max(spendLimit || 0, maxSaleAmount);
+  if (!Number.isFinite(state.stake) || state.stake <= 0) state.stake = amountLimit > 0 ? Math.min(10, amountLimit) : null;
+  else if (amountLimit <= 0) state.stake = null;
+  else state.stake = Math.min(state.stake, amountLimit);
 
   const wrapper = element('div', 'detail-content');
   const top = element('div', 'detail-topline');
@@ -368,11 +383,11 @@ function renderMarketDetail() {
   stakeInput.className = 'stake-picker';
   stakeInput.type = 'number';
   stakeInput.min = '0.01';
-  stakeInput.max = String(Math.max(0, stakeLimit));
+  stakeInput.max = String(Math.max(0, amountLimit));
   stakeInput.step = '0.01';
   stakeInput.inputMode = 'decimal';
   stakeInput.value = Number.isFinite(state.stake) ? String(state.stake) : '';
-  stakeInput.setAttribute('aria-label', 'Practice points to use for each pick');
+  stakeInput.setAttribute('aria-label', 'Points to buy or sell per pick');
   stakeInput.addEventListener('input', updateStakeControls);
   stakeLabel.append(stakeInput);
 
@@ -406,18 +421,24 @@ function renderMarketDetail() {
     backButton.dataset.outcomeId = outcome.id;
     backButton.dataset.outcomeLabel = outcome.label;
     backButton.setAttribute('aria-label', `${actionLabel()} on ${outcome.label}`);
-    const validStake = Number.isFinite(state.stake) && state.stake >= 0.01 && state.stake <= stakeLimit;
+    const validStake = Number.isFinite(state.stake) && state.stake >= 0.01 && state.stake <= amountLimit;
     backButton.disabled = !validStake || setupMissing || market.status !== 'open' || (state.profile && balance < state.stake);
     actions.append(backButton);
 
     const heldShares = Number(state.position[outcome.id]) || 0;
     if (state.profile && heldShares > 0) {
-      const estimate = floorPoints(proceedsForSale(market.outcomes, index, heldShares, market.liquidity || MARKET_LIQUIDITY));
-      const sellButton = element('button', 'sell-button', `Sell · ${formatPoints(estimate)}`);
+      const quote = proceedsForSale(market.outcomes, index, heldShares, market.liquidity || MARKET_LIQUIDITY);
+      const estimate = floorPoints(Math.min(quote, Number(market.pointPool) || 0));
+      const sellAmount = Math.min(state.stake || 0, estimate);
+      const sellButton = element('button', 'sell-button', `Sell ${formatPoints(sellAmount)}`);
       sellButton.type = 'button';
       sellButton.dataset.sellOutcomeId = outcome.id;
-      sellButton.setAttribute('aria-label', `Sell all ${heldShares.toFixed(2)} ${outcome.label} shares for approximately ${formatPoints(estimate)} at the current market price`);
-      sellButton.disabled = market.status !== 'open' || estimate < 0.01;
+      sellButton.dataset.outcomeLabel = outcome.label;
+      sellButton.dataset.maxSellPoints = String(estimate);
+      sellButton.dataset.sellAmount = String(sellAmount);
+      sellButton.setAttribute('aria-label', `Sell ${formatPoints(sellAmount)} worth of ${outcome.label} at the current market price. Maximum available: ${formatPoints(estimate)}.`);
+      sellButton.title = `Maximum available: ${formatPoints(estimate)}`;
+      sellButton.disabled = !validStake || market.status !== 'open' || sellAmount < 0.01;
       actions.append(sellButton);
     }
 
@@ -792,7 +813,7 @@ async function backOutcome(outcomeId) {
   }
 }
 
-async function sellOutcome(outcomeId) {
+async function sellOutcome(outcomeId, amount) {
   const market = state.markets.find((item) => item.id === state.selectedId);
   if (!market) return;
   if (!state.profile) {
@@ -803,7 +824,7 @@ async function sellOutcome(outcomeId) {
   try {
     const result = await requestApi(`/api/markets/${encodeURIComponent(market.id)}/sell`, {
       method: 'POST',
-      body: JSON.stringify({ outcomeId }),
+      body: JSON.stringify({ outcomeId, amount }),
     });
     state.profile = result.profile;
     state.markets = state.markets.map((item) => item.id === market.id ? result.market : item);
@@ -811,7 +832,7 @@ async function sellOutcome(outcomeId) {
     state.priceHistoryMarketId = market.id;
     state.priceHistory = result.market.priceHistory || [];
     render();
-    showToast(`Sold ${Number(result.soldShares).toFixed(2)} shares for ${formatPoints(result.proceeds)} at the current quote.`);
+    showToast(`Sold ${formatPoints(result.proceeds)} worth of this pick.`);
   } catch (error) {
     showToast(error.message);
   }
@@ -831,7 +852,7 @@ el.marketList.addEventListener('click', (event) => {
 el.marketDetail.addEventListener('click', (event) => {
   const sellButton = event.target.closest('button[data-sell-outcome-id]');
   if (sellButton) {
-    sellOutcome(sellButton.dataset.sellOutcomeId);
+    sellOutcome(sellButton.dataset.sellOutcomeId, Number(sellButton.dataset.sellAmount));
     return;
   }
   const button = event.target.closest('button[data-outcome-id]');
