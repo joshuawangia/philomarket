@@ -1,0 +1,11 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // All market and points reads/writes go through the verified Vercel API.
+    // The Admin SDK is the only writer; it validates email verification and
+    // applies point changes inside Firestore transactions.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "philomarket",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "firebase": "^13.1.0",
+    "firebase-admin": "^13.10.0"
+  },
+  "devDependencies": {
+    "vite": "^8.3.5"
+  }
+}

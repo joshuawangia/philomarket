@@ -1,0 +1,919 @@
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  sendEmailVerification,
+  signInWithEmailAndPassword,
+  signOut,
+} from 'firebase/auth';
+import { auth, firebaseConfigured } from './firebase.js';
+import { appendPriceHistory, floorPoints, MARKET_LIQUIDITY, marketProbabilities, proceedsForSale } from './marketMath.js';
+
+const INITIAL_POINTS = 500;
+const PREVIEW_KEY = 'philomarket.preview.v2';
+const previewMode = import.meta.env.DEV && !firebaseConfigured;
+const setupMissing = !firebaseConfigured && !previewMode;
+
+const initialNames = [
+  'Isai Medina', 'Rowan Liddell', 'Emily Tacey', 'Emylee Perkins', 'Betsy Barnard',
+  'Qaira Saldivar', 'Omer Alp Danis', 'Grace Burke', 'David Li', 'Nicholas Ingram', 'Bobby McCann',
+];
+const initialColors = [
+  '#3e6b69', '#8c7045', '#735a85', '#437762', '#a35b50', '#546f9b',
+  '#82703e', '#477a7e', '#83614d', '#687d4c', '#92596d',
+];
+
+const el = {
+  accountSummary: document.querySelector('#account-summary'),
+  headerPoints: document.querySelector('#header-points'),
+  accountButton: document.querySelector('#account-button'),
+  signOutButton: document.querySelector('#sign-out-button'),
+  signInButton: document.querySelector('#sign-in-button'),
+  environmentBanner: document.querySelector('#environment-banner'),
+  marketList: document.querySelector('#market-list'),
+  marketCount: document.querySelector('#market-count'),
+  emptyMarkets: document.querySelector('#empty-markets'),
+  marketDetail: document.querySelector('#market-detail'),
+  search: document.querySelector('#market-search'),
+  sort: document.querySelector('#market-sort'),
+  authDialog: document.querySelector('#auth-dialog'),
+  authForm: document.querySelector('#auth-form'),
+  authTitle: document.querySelector('#auth-title'),
+  authCopy: document.querySelector('#auth-copy'),
+  authFields: document.querySelector('#auth-fields'),
+  authEmail: document.querySelector('#auth-email'),
+  authPassword: document.querySelector('#auth-password'),
+  authError: document.querySelector('#auth-error'),
+  authSubmit: document.querySelector('#auth-submit'),
+  authToggle: document.querySelector('#auth-mode-toggle'),
+  authToggleCopy: document.querySelector('#mode-switch-copy'),
+  verifyPanel: document.querySelector('#verify-panel'),
+  setupHint: document.querySelector('#setup-hint'),
+  createDialog: document.querySelector('#create-dialog'),
+  createForm: document.querySelector('#create-form'),
+  question: document.querySelector('#market-question'),
+  outcomes: document.querySelector('#market-outcomes'),
+  createError: document.querySelector('#create-error'),
+  createSubmit: document.querySelector('#create-submit'),
+  createSetupHint: document.querySelector('#create-setup-hint'),
+  toast: document.querySelector('#toast'),
+};
+
+function makeOutcomeId(label, index) {
+  const slug = label.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'outcome';
+  return `${slug}-${index + 1}`;
+}
+
+function makeInitialMarket() {
+  const outcomes = initialNames.map((label, index) => ({ id: makeOutcomeId(label, index), label, shares: 0 }));
+  return {
+    id: 'scriba-first',
+    question: 'Which baby will become a Scriba?',
+    outcomes,
+    liquidity: MARKET_LIQUIDITY,
+    pointPool: 0,
+    backCount: 0,
+    sellCount: 0,
+    priceHistory: appendPriceHistory([], outcomes),
+    status: 'open',
+    creatorUid: null,
+    createdAt: new Date('2026-10-29T12:00:00.000Z').toISOString(),
+  };
+}
+
+function readPreview() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PREVIEW_KEY));
+    if (
+      saved && Array.isArray(saved.markets) && saved.markets.every((market) =>
+        typeof market.id === 'string' && typeof market.question === 'string' && Array.isArray(market.outcomes)) &&
+      Number.isInteger(saved.balance) && saved.balance >= 0
+    ) return saved;
+  } catch { /* Local preview still works when browser storage is unavailable. */ }
+  return { markets: [makeInitialMarket()], balance: INITIAL_POINTS };
+}
+
+const preview = readPreview();
+const state = {
+  markets: [],
+  selectedId: '',
+  profile: null,
+  user: null,
+  position: {},
+  priceHistory: [],
+  priceHistoryMarketId: '',
+  authMode: 'signin',
+  marketFilter: 'all',
+  search: '',
+  sort: 'active',
+  stake: 10,
+  marketError: '',
+  lastSynced: null,
+};
+let toastTimer;
+
+function marketChance(market, outcome) {
+  const index = market.outcomes.indexOf(outcome);
+  return (marketProbabilities(market.outcomes, market.liquidity || MARKET_LIQUIDITY)[index] || 0) * 100;
+}
+
+function formatPoints(value) {
+  return `${Number(value || 0).toLocaleString()} pts`;
+}
+
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function renderEnvironment() {
+  const message = previewMode
+    ? 'Local preview · 500 sample points and market creation stay on this device. A verified email is required to trade; configure Firebase to enable accounts and shared markets.'
+    : setupMissing
+      ? 'Setup needed · connect the Firebase web configuration to enable email accounts and shared markets.'
+      : state.marketError || '';
+  el.environmentBanner.hidden = !message;
+  el.environmentBanner.textContent = message;
+  el.environmentBanner.classList.toggle('is-warning', !previewMode && Boolean(message));
+}
+
+function renderHeader() {
+  if (previewMode) {
+    el.accountSummary.hidden = false;
+    el.signOutButton.hidden = true;
+    el.signInButton.hidden = false;
+    el.headerPoints.textContent = String(preview.balance);
+    el.accountButton.textContent = 'Local demo';
+    el.accountButton.title = 'Local preview account';
+    el.signInButton.textContent = 'Sign in';
+    el.signInButton.classList.add('preview-sign-in');
+    return;
+  }
+  el.signInButton.classList.remove('preview-sign-in');
+  if (state.profile) {
+    el.accountSummary.hidden = false;
+    el.signOutButton.hidden = false;
+    el.signInButton.hidden = true;
+    el.headerPoints.textContent = String(state.profile.points);
+    el.accountButton.textContent = state.profile.email || 'Account';
+    el.accountButton.title = `Signed in as ${state.profile.email || 'account'}`;
+  } else {
+    el.accountSummary.hidden = true;
+    el.signOutButton.hidden = true;
+    el.signInButton.hidden = false;
+    el.signInButton.textContent = state.user?.emailVerified ? 'Finish sign-in' : state.user ? 'Verify email' : 'Sign in';
+  }
+}
+
+function marketIsMine(market) {
+  if (previewMode) return market.creatorUid === 'preview-user';
+  return Boolean(state.profile && market.isMine);
+}
+
+function filteredMarkets() {
+  const query = state.search.trim().toLocaleLowerCase();
+  let results = state.markets.filter((market) => {
+    if (state.marketFilter === 'mine' && !marketIsMine(market)) return false;
+    if (!query) return true;
+    return `${market.question} ${market.outcomes.map((outcome) => outcome.label).join(' ')}`.toLocaleLowerCase().includes(query);
+  });
+
+  if (state.sort === 'newest') results = results.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  else if (state.sort === 'alphabetical') results = results.sort((a, b) => a.question.localeCompare(b.question));
+  else results = results.sort((a, b) => (b.pointPool || 0) - (a.pointPool || 0) || b.createdAt.localeCompare(a.createdAt));
+  return results;
+}
+
+function renderMarketList() {
+  const markets = filteredMarkets();
+  const fragment = document.createDocumentFragment();
+  el.marketCount.textContent = String(markets.length);
+  el.emptyMarkets.hidden = markets.length > 0;
+
+  markets.forEach((market) => {
+    const button = element('button', `market-list-item${market.id === state.selectedId ? ' is-selected' : ''}`);
+    button.type = 'button';
+    button.dataset.marketId = market.id;
+    button.setAttribute('aria-pressed', String(market.id === state.selectedId));
+    const tag = element('span', 'market-list-tag', `${market.status === 'open' ? 'OPEN' : market.status.toUpperCase()}  ·  ${market.outcomes.length} OUTCOMES`);
+    const question = element('strong', 'market-list-question', market.question);
+    const lead = market.outcomes.reduce((best, current) => marketChance(market, current) > marketChance(market, best) ? current : best, market.outcomes[0]);
+    const details = element('span', 'market-list-details');
+    details.append(
+      element('span', 'market-leader', `${lead.label} · ${marketChance(market, lead).toFixed(1)}%`),
+      element('span', 'market-pool-total', formatPoints(market.pointPool)),
+    );
+    const miniature = element('span', 'market-mini-bar');
+    market.outcomes.forEach((outcome, index) => {
+      const segment = element('i', 'mini-segment');
+      segment.style.flexGrow = String(marketChance(market, outcome));
+      segment.style.backgroundColor = initialColors[index % initialColors.length];
+      miniature.append(segment);
+    });
+    button.append(tag, question, details, miniature);
+    fragment.append(button);
+  });
+  el.marketList.replaceChildren(fragment);
+}
+
+function currentBalance() {
+  if (previewMode) return preview.balance;
+  return state.profile?.points ?? null;
+}
+
+function actionLabel() {
+  if (state.profile) return Number.isFinite(state.stake) ? `Back ${state.stake} pts` : 'Choose amount';
+  if (state.user && !state.user.emailVerified) return 'Verify email';
+  if (state.user?.emailVerified) return 'Loading account';
+  if (setupMissing) return 'Setup needed';
+  return 'Sign in';
+}
+
+function updateStakeControls() {
+  const input = el.marketDetail.querySelector('#stake-input');
+  if (!input) return;
+  const raw = input.value.trim();
+  const amount = Number(raw);
+  const cents = Math.round(amount * 100);
+  const max = Number(input.max);
+  const valid = raw !== '' && Number.isFinite(amount) && cents > 0 && Math.abs(amount - cents / 100) < 1e-8 && amount <= max;
+  state.stake = valid ? cents / 100 : null;
+  const market = state.markets.find((item) => item.id === state.selectedId);
+  const balance = currentBalance();
+  el.marketDetail.querySelectorAll('.back-button').forEach((button) => {
+    button.textContent = actionLabel();
+    button.setAttribute('aria-label', `${actionLabel()} on ${button.dataset.outcomeLabel}`);
+    button.disabled = !valid || setupMissing || market?.status !== 'open' || (state.profile && balance < state.stake);
+  });
+}
+
+function renderPriceChart(market) {
+  const section = element('section', 'price-chart-section');
+  const heading = element('div', 'price-chart-heading');
+  heading.append(element('h3', '', 'Price history'), element('span', '', 'Simulated $1 contract scale'));
+  section.append(heading);
+
+  const width = 720;
+  const height = 146;
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'price-chart');
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `Price history for ${market.question}`);
+  [0, 0.25, 0.5, 0.75, 1].forEach((level) => {
+    const line = document.createElementNS(svg.namespaceURI, 'line');
+    const y = 8 + (height - 16) * (1 - level);
+    line.setAttribute('x1', '0');
+    line.setAttribute('x2', String(width));
+    line.setAttribute('y1', String(y));
+    line.setAttribute('y2', String(y));
+    line.setAttribute('class', 'chart-grid-line');
+    svg.append(line);
+  });
+
+  const current = marketProbabilities(market.outcomes, market.liquidity || MARKET_LIQUIDITY);
+  const storedHistory = state.priceHistoryMarketId === market.id && state.priceHistory.length
+    ? state.priceHistory
+    : market.priceHistory;
+  const history = Array.isArray(storedHistory) && storedHistory.length
+    ? storedHistory.slice(-80)
+    : [{ at: Date.now(), prices: current }];
+  const start = Number(history[0]?.at) || 0;
+  const end = Number(history[history.length - 1]?.at) || start;
+  const xFor = (point, index) => end > start
+    ? ((Number(point.at) - start) / (end - start)) * width
+    : history.length > 1 ? (index / (history.length - 1)) * width : 0;
+  const yFor = (price) => 8 + (height - 16) * (1 - Math.max(0, Math.min(1, price)));
+
+  market.outcomes.forEach((outcome, outcomeIndex) => {
+    const points = history.map((point, index) => ({
+      x: xFor(point, index),
+      y: yFor(Number(point.prices?.[outcomeIndex]) || 0),
+    }));
+    if (points.length === 1) points.push({ x: width, y: points[0].y });
+    const path = document.createElementNS(svg.namespaceURI, 'path');
+    path.setAttribute('d', points.map((point, index) => `${index ? 'L' : 'M'}${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' '));
+    path.setAttribute('class', 'chart-series');
+    path.setAttribute('stroke', initialColors[outcomeIndex % initialColors.length]);
+    path.setAttribute('aria-label', `${outcome.label}: $${(current[outcomeIndex] || 0).toFixed(2)}`);
+    svg.append(path);
+  });
+  section.append(svg);
+
+  const legend = element('div', 'price-chart-legend');
+  market.outcomes.forEach((outcome, index) => {
+    const item = element('span', 'chart-legend-item');
+    const dot = element('i', 'chart-legend-dot');
+    dot.style.backgroundColor = initialColors[index % initialColors.length];
+    const name = element('span', 'chart-legend-name', outcome.label);
+    const price = element('strong', '', `$${(current[index] || 0).toFixed(2)}`);
+    item.append(dot, name, price);
+    legend.append(item);
+  });
+  section.append(legend);
+  return section;
+}
+
+function renderMarketDetail() {
+  const market = state.markets.find((item) => item.id === state.selectedId);
+  if (!market) {
+    el.marketDetail.replaceChildren(element('div', 'detail-empty', 'Choose a market to see its outcomes.'));
+    return;
+  }
+
+  const balance = currentBalance();
+  const stakeLimit = balance ?? INITIAL_POINTS;
+  if (!Number.isFinite(stakeLimit) || stakeLimit <= 0) state.stake = null;
+  else if (!Number.isFinite(state.stake) || state.stake <= 0) state.stake = Math.min(10, stakeLimit);
+  else state.stake = Math.min(state.stake, stakeLimit);
+
+  const wrapper = element('div', 'detail-content');
+  const top = element('div', 'detail-topline');
+  const marketLabel = element('span', 'detail-market-label');
+  marketLabel.append(element('i', 'market-status-dot'), `${market.status === 'open' ? 'OPEN' : market.status.toUpperCase()}  ·  ${market.outcomes.length} OUTCOMES`);
+  const refreshedAt = state.lastSynced
+    ? `Updated ${new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(state.lastSynced)}`
+    : 'Not synced yet';
+  const refreshTools = element('div', 'refresh-tools');
+  refreshTools.append(element('span', 'refresh-label', refreshedAt));
+  const refreshButton = element('button', 'refresh-button', '↻ Refresh');
+  refreshButton.type = 'button';
+  refreshButton.setAttribute('aria-label', 'Refresh shared market odds');
+  refreshButton.addEventListener('click', () => refreshMarkets());
+  refreshTools.append(refreshButton);
+  top.append(marketLabel, refreshTools);
+
+  const title = element('h2', 'detail-title', market.question);
+  title.id = 'detail-title';
+  const description = element('p', 'detail-description', 'The high-liquidity curve moves prices gradually. Selling follows the reverse curve, so a no-change buy-and-sell round trip cannot cash out higher.');
+
+  const stats = element('div', 'detail-stats');
+  const poolStat = element('div', 'detail-stat');
+  poolStat.append(element('span', '', 'POINTS IN PLAY'), element('strong', '', formatPoints(market.pointPool)));
+  const tradesStat = element('div', 'detail-stat');
+  tradesStat.append(element('span', '', 'BACKERS'), element('strong', '', Number(market.backerCount || 0).toLocaleString()));
+  const oddsStat = element('div', 'detail-stat');
+  oddsStat.append(element('span', '', 'OUTCOMES'), element('strong', '', String(market.outcomes.length)));
+  stats.append(poolStat, tradesStat, oddsStat);
+
+  const outcomeSection = element('section', 'outcome-section');
+  const sectionHeading = element('div', 'outcome-section-heading');
+  sectionHeading.append(element('h3', '', 'Outcomes'), element('label', 'stake-picker-label'));
+  const stakeLabel = sectionHeading.querySelector('label');
+  stakeLabel.htmlFor = 'stake-input';
+  stakeLabel.append(document.createTextNode('Points per pick '));
+  const stakeInput = document.createElement('input');
+  stakeInput.id = 'stake-input';
+  stakeInput.className = 'stake-picker';
+  stakeInput.type = 'number';
+  stakeInput.min = '0.01';
+  stakeInput.max = String(Math.max(0, stakeLimit));
+  stakeInput.step = '0.01';
+  stakeInput.inputMode = 'decimal';
+  stakeInput.value = Number.isFinite(state.stake) ? String(state.stake) : '';
+  stakeInput.setAttribute('aria-label', 'Practice points to use for each pick');
+  stakeInput.addEventListener('input', updateStakeControls);
+  stakeLabel.append(stakeInput);
+
+  const list = element('ol', 'outcome-table');
+  list.setAttribute('aria-label', 'Market prices and trading actions');
+  const tableHeader = element('li', 'outcome-table-header');
+  tableHeader.append(element('span', '', 'Outcome'), element('span', '', 'Market price'), element('span', '', 'Trade'));
+  list.append(tableHeader);
+
+  market.outcomes.forEach((outcome, index) => {
+    const chance = marketChance(market, outcome);
+    const row = element('li', 'outcome-row');
+    const outcomeIdentity = element('div', 'outcome-identity');
+    const badge = element('span', 'outcome-badge', String(index + 1).padStart(2, '0'));
+    badge.style.setProperty('--badge-color', initialColors[index % initialColors.length]);
+    const name = element('span', 'outcome-name', outcome.label);
+    outcomeIdentity.append(badge, name);
+
+    const chanceCell = element('div', 'outcome-chance');
+    chanceCell.append(element('strong', 'chance-pill', `$${(chance / 100).toFixed(2)}`));
+    const track = element('span', 'chance-track');
+    track.setAttribute('aria-hidden', 'true');
+    const fill = element('i', 'chance-fill');
+    fill.style.width = `${chance}%`;
+    track.append(fill);
+    chanceCell.append(track, element('small', 'outcome-points', `${chance.toFixed(1)}% implied chance`));
+
+    const actions = element('div', 'outcome-actions');
+    const backButton = element('button', 'back-button', actionLabel());
+    backButton.type = 'button';
+    backButton.dataset.outcomeId = outcome.id;
+    backButton.dataset.outcomeLabel = outcome.label;
+    backButton.setAttribute('aria-label', `${actionLabel()} on ${outcome.label}`);
+    const validStake = Number.isFinite(state.stake) && state.stake >= 0.01 && state.stake <= stakeLimit;
+    backButton.disabled = !validStake || setupMissing || market.status !== 'open' || (state.profile && balance < state.stake);
+    actions.append(backButton);
+
+    const heldShares = Number(state.position[outcome.id]) || 0;
+    if (state.profile && heldShares > 0) {
+      const estimate = floorPoints(proceedsForSale(market.outcomes, index, heldShares, market.liquidity || MARKET_LIQUIDITY));
+      const sellButton = element('button', 'sell-button', `Sell · ${formatPoints(estimate)}`);
+      sellButton.type = 'button';
+      sellButton.dataset.sellOutcomeId = outcome.id;
+      sellButton.setAttribute('aria-label', `Sell all ${heldShares.toFixed(2)} ${outcome.label} shares for approximately ${formatPoints(estimate)} at the current market price`);
+      sellButton.disabled = market.status !== 'open' || estimate < 0.01;
+      actions.append(sellButton);
+    }
+
+    row.append(outcomeIdentity, chanceCell, actions);
+    list.append(row);
+  });
+  outcomeSection.append(sectionHeading, list);
+
+  const explanation = element('p', 'detail-footnote');
+  explanation.append(
+    element('span', 'footnote-icon', 'i'),
+    document.createTextNode('Prices use a simulated $1 contract scale. Points have no cash value; there are no real-money trades, prizes, or payouts.'),
+  );
+
+  wrapper.append(top, title, description, stats, renderPriceChart(market), outcomeSection, explanation);
+  el.marketDetail.replaceChildren(wrapper);
+}
+
+function render() {
+  renderEnvironment();
+  renderHeader();
+  renderMarketList();
+  renderMarketDetail();
+}
+
+async function requestApi(path, options = {}) {
+  const { auth = true, headers: requestHeaders, ...requestOptions } = options;
+  const headers = { 'Content-Type': 'application/json', ...requestHeaders };
+  if (auth && state.user) headers.Authorization = `Bearer ${await state.user.getIdToken()}`;
+  const response = await fetch(path, { ...requestOptions, headers });
+  let result;
+  try { result = await response.json(); }
+  catch { throw new Error('The market API is not available.'); }
+  if (!response.ok) throw new Error(result.error || 'The request could not be completed.');
+  return result;
+}
+
+async function refreshSelectedMarketData() {
+  const marketId = state.selectedId;
+  const market = state.markets.find((item) => item.id === marketId);
+  if (!marketId || !market) {
+    state.position = {};
+    state.priceHistory = [];
+    state.priceHistoryMarketId = '';
+    renderMarketDetail();
+    return;
+  }
+  const historyRequest = requestApi(`/api/markets/${encodeURIComponent(marketId)}/history`, { auth: false });
+  const positionRequest = state.profile && !previewMode
+    ? requestApi(`/api/markets/${encodeURIComponent(marketId)}/position`)
+    : Promise.resolve({ position: {} });
+  const [historyResult, positionResult] = await Promise.allSettled([historyRequest, positionRequest]);
+  if (marketId !== state.selectedId) return;
+  state.priceHistoryMarketId = marketId;
+  state.priceHistory = historyResult.status === 'fulfilled'
+    ? historyResult.value.priceHistory || []
+    : market.priceHistory || [];
+  state.position = positionResult.status === 'fulfilled' ? positionResult.value.position || {} : {};
+  if (positionResult.status === 'rejected' && state.profile) state.marketError = positionResult.reason.message;
+  renderMarketDetail();
+}
+
+function writePreview() {
+  try {
+    localStorage.setItem(PREVIEW_KEY, JSON.stringify({ markets: preview.markets, balance: preview.balance }));
+  } catch { /* The local preview still works until the page is closed. */ }
+}
+
+async function refreshMarkets() {
+  try {
+    const result = await requestApi('/api/markets', { method: 'GET' });
+    if (!Array.isArray(result.markets)) throw new Error('Market response is incomplete.');
+    state.markets = result.markets;
+    state.marketError = '';
+  } catch (error) {
+    if (previewMode) {
+      if (!preview.markets.length) preview.markets.push(makeInitialMarket());
+      state.markets = preview.markets;
+    } else {
+      if (!state.markets.length) state.markets = [makeInitialMarket()];
+      state.marketError = error.message;
+    }
+  }
+  if (!state.selectedId || !state.markets.some((market) => market.id === state.selectedId)) {
+    state.selectedId = state.markets[0]?.id || '';
+  }
+  state.lastSynced = new Date();
+  render();
+  await refreshSelectedMarketData();
+}
+
+function showToast(message) {
+  window.clearTimeout(toastTimer);
+  el.toast.textContent = message;
+  el.toast.classList.add('is-visible');
+  toastTimer = window.setTimeout(() => el.toast.classList.remove('is-visible'), 2600);
+}
+
+function showFormError(node, message) {
+  node.hidden = !message;
+  node.textContent = message;
+}
+
+function setAuthMode(mode) {
+  state.authMode = mode;
+  const signup = mode === 'signup';
+  el.authTitle.textContent = signup ? 'Create your account' : 'Sign in to Philomarket';
+  el.authCopy.textContent = signup
+    ? 'Verify your email to activate your account and receive 500 practice points.'
+    : 'Your verified email account keeps your 500 practice points and market picks together.';
+  el.authSubmit.textContent = signup ? 'Create account & send link' : 'Continue with email';
+  el.authToggleCopy.textContent = signup ? 'Already have an account?' : 'New to Philomarket?';
+  el.authToggle.textContent = signup ? 'Sign in' : 'Create account';
+  el.authPassword.autocomplete = signup ? 'new-password' : 'current-password';
+  showFormError(el.authError, '');
+}
+
+function showVerification(user) {
+  el.authFields.hidden = true;
+  el.authSubmit.hidden = true;
+  el.authToggle.closest('.mode-switch').hidden = true;
+  el.verifyPanel.hidden = false;
+  el.authTitle.textContent = 'Verify your email';
+  el.authCopy.textContent = `We sent a verification link to ${user?.email || 'your email address'}. Your 500 points activate after verification.`;
+  el.authDialog.showModal();
+}
+
+function resetAuthDialog() {
+  el.authFields.hidden = false;
+  el.authSubmit.hidden = false;
+  el.authToggle.closest('.mode-switch').hidden = false;
+  el.verifyPanel.hidden = true;
+  el.setupHint.hidden = !setupMissing && !previewMode;
+  el.authForm.reset();
+  setAuthMode('signin');
+}
+
+async function loadProfile(user) {
+  state.user = user;
+  state.position = {};
+  if (!user || !user.emailVerified) {
+    state.profile = null;
+    state.position = {};
+    render();
+    return;
+  }
+  try {
+    await user.getIdToken(true);
+    const result = await requestApi('/api/profile');
+    state.profile = result.profile;
+    state.marketError = '';
+    render();
+    await refreshMarkets();
+  } catch (error) {
+    state.profile = null;
+    state.marketError = error.message;
+    render();
+    showToast(error.message);
+  }
+}
+
+function openAuthDialog() {
+  resetAuthDialog();
+  if (previewMode) {
+    el.setupHint.hidden = false;
+    el.setupHint.textContent = 'The local preview uses sample points on this device. Firebase configuration enables real verified accounts and shared balances.';
+  }
+  if (setupMissing) {
+    el.setupHint.hidden = false;
+    el.setupHint.textContent = 'Firebase is not configured for this deployment yet. Add the client configuration and server service account to enable email accounts.';
+  }
+  if (state.user && !state.user.emailVerified) showVerification(state.user);
+  else el.authDialog.showModal();
+}
+
+async function submitAuth(event) {
+  event.preventDefault();
+  showFormError(el.authError, '');
+  if (!firebaseConfigured) {
+    showFormError(el.authError, previewMode
+      ? 'Email sign-in is unavailable in this local preview. The 500-point sample account remains on this device.'
+      : 'Connect Firebase to enable email sign-in.');
+    return;
+  }
+
+  const email = el.authEmail.value.trim();
+  const password = el.authPassword.value;
+  el.authSubmit.disabled = true;
+  try {
+    if (state.authMode === 'signup') {
+      const credential = await createUserWithEmailAndPassword(auth, email, password);
+      state.user = credential.user;
+      await sendEmailVerification(credential.user);
+      renderHeader();
+      showVerification(credential.user);
+      return;
+    }
+
+    const credential = await signInWithEmailAndPassword(auth, email, password);
+    await credential.user.reload();
+    state.user = auth.currentUser;
+    if (!state.user.emailVerified) {
+      renderHeader();
+      showVerification(state.user);
+      return;
+    }
+    await loadProfile(state.user);
+    if (state.profile) {
+      el.authDialog.close();
+      showToast(`Welcome back. ${state.profile.points} points are ready.`);
+    }
+  } catch (error) {
+    const message = error.code === 'auth/email-already-in-use'
+      ? 'That email already has an account. Sign in instead.'
+      : error.code === 'auth/weak-password'
+        ? 'Choose a password with at least 8 characters.'
+        : error.code === 'auth/invalid-credential'
+          ? 'That email and password did not match.'
+          : error.code === 'auth/too-many-requests'
+            ? 'Too many attempts. Wait a moment and try again.'
+            : error.message || 'Sign-in could not be completed.';
+    showFormError(el.authError, message);
+  } finally {
+    el.authSubmit.disabled = false;
+  }
+}
+
+async function checkVerification() {
+  if (!auth?.currentUser) return showFormError(el.authError, 'Sign in again to check your verification status.');
+  try {
+    await auth.currentUser.reload();
+    state.user = auth.currentUser;
+    if (!state.user.emailVerified) {
+      return showFormError(el.authError, 'Your email is not verified yet. Open the email link, then try again.');
+    }
+    await loadProfile(state.user);
+    if (state.profile) {
+      el.authDialog.close();
+      showToast('Email verified. Your 500 practice points are ready.');
+    }
+  } catch (error) {
+    showFormError(el.authError, error.message || 'Could not check verification status.');
+  }
+}
+
+async function resendVerification() {
+  if (!auth?.currentUser) return showFormError(el.authError, 'Sign in again to resend the verification email.');
+  try {
+    await sendEmailVerification(auth.currentUser);
+    showFormError(el.authError, 'Another verification link is on its way.');
+  } catch (error) {
+    showFormError(el.authError, error.code === 'auth/too-many-requests' ? 'Please wait before requesting another email.' : 'Could not send the email right now.');
+  }
+}
+
+function openCreateDialog() {
+  showFormError(el.createError, '');
+  el.createForm.reset();
+  const atMarketLimit = !previewMode && Number(state.profile?.marketsCreated || 0) >= 10;
+  el.createSubmit.disabled = atMarketLimit;
+  el.createSetupHint.hidden = !previewMode && !setupMissing && Boolean(state.profile);
+  if (previewMode) {
+    el.createSetupHint.hidden = false;
+    el.createSetupHint.textContent = 'Local preview markets are stored on this device and are not shared.';
+  } else if (setupMissing) {
+    el.createSetupHint.hidden = false;
+    el.createSetupHint.textContent = 'Connect Firebase before publishing a shared market.';
+  } else if (!state.profile) {
+    el.createSetupHint.hidden = false;
+    el.createSetupHint.textContent = 'Sign in with a verified email to publish this market.';
+  }
+  if (atMarketLimit) {
+    el.createSetupHint.hidden = false;
+    el.createSetupHint.textContent = 'This account has reached its 10-market creation limit.';
+  }
+  el.createDialog.showModal();
+}
+
+function validateMarketInput(question, labels) {
+  if (question.length < 8 || question.length > 140) return 'Write a market question between 8 and 140 characters.';
+  if (labels.length < 2 || labels.length > 12) return 'Add between 2 and 12 outcomes, one per line.';
+  if (labels.some((label) => label.length < 1 || label.length > 50)) return 'Each outcome must be 1 to 50 characters.';
+  if (new Set(labels.map((label) => label.toLocaleLowerCase())).size !== labels.length) return 'Outcome names must be unique.';
+  return '';
+}
+
+async function submitMarket(event) {
+  event.preventDefault();
+  showFormError(el.createError, '');
+  const question = el.question.value.trim();
+  const labels = el.outcomes.value.split(/\r?\n/).map((label) => label.trim()).filter(Boolean);
+  const validationError = validateMarketInput(question, labels);
+  if (validationError) return showFormError(el.createError, validationError);
+  if (!previewMode && !state.profile) {
+    el.createDialog.close();
+    openAuthDialog();
+    showFormError(el.authError, state.user ? 'Verify your email before publishing a market.' : 'Sign in with a verified email to publish a market.');
+    return;
+  }
+
+  el.createSubmit.disabled = true;
+  try {
+    let market;
+    if (previewMode) {
+      market = {
+        id: `local-${crypto.randomUUID()}`,
+        question,
+        outcomes: labels.map((label, index) => ({ id: makeOutcomeId(label, index), label, shares: 0 })),
+        liquidity: MARKET_LIQUIDITY,
+        pointPool: 0,
+        backCount: 0,
+        sellCount: 0,
+        priceHistory: appendPriceHistory([], labels.map(() => ({ shares: 0 }))),
+        status: 'open',
+        creatorUid: 'preview-user',
+        createdAt: new Date().toISOString(),
+      };
+      preview.markets.unshift(market);
+      writePreview();
+    } else {
+      const result = await requestApi('/api/markets', {
+        method: 'POST',
+        body: JSON.stringify({ question, outcomes: labels }),
+      });
+      market = result.market;
+      state.profile = result.profile;
+      state.markets.unshift(market);
+      state.position = result.position || {};
+    }
+    state.selectedId = market.id;
+    state.priceHistoryMarketId = market.id;
+    state.priceHistory = market.priceHistory || [];
+    state.marketFilter = 'all';
+    document.querySelector('[data-filter="all"]').click();
+    el.createDialog.close();
+    render();
+    showToast('Market created. Every outcome starts evenly.');
+  } catch (error) {
+    showFormError(el.createError, error.message);
+  } finally {
+    el.createSubmit.disabled = false;
+  }
+}
+
+async function backOutcome(outcomeId) {
+  const market = state.markets.find((item) => item.id === state.selectedId);
+  if (!market) return;
+  if (!state.profile) {
+    openAuthDialog();
+    showFormError(el.authError, state.user && !state.user.emailVerified
+      ? 'Verify your email before using points.'
+      : 'Sign in with a verified email before backing a market.');
+    return;
+  }
+  if (!Number.isFinite(state.stake) || state.stake < 0.01) return showToast('Enter a point amount to use for this pick.');
+  if (currentBalance() < state.stake) return showToast('You do not have enough points for that pick.');
+
+  try {
+    const result = await requestApi(`/api/markets/${encodeURIComponent(market.id)}/back`, {
+      method: 'POST',
+      body: JSON.stringify({ outcomeId, amount: state.stake }),
+    });
+    state.profile = result.profile;
+    state.markets = state.markets.map((item) => item.id === market.id ? result.market : item);
+    state.position = result.position || {};
+    state.priceHistoryMarketId = market.id;
+    state.priceHistory = result.market.priceHistory || [];
+    render();
+    showToast(`Position added for ${formatPoints(state.stake)}. No money involved.`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function sellOutcome(outcomeId) {
+  const market = state.markets.find((item) => item.id === state.selectedId);
+  if (!market) return;
+  if (!state.profile) {
+    openAuthDialog();
+    showFormError(el.authError, 'Sign in with a verified email before selling a position.');
+    return;
+  }
+  try {
+    const result = await requestApi(`/api/markets/${encodeURIComponent(market.id)}/sell`, {
+      method: 'POST',
+      body: JSON.stringify({ outcomeId }),
+    });
+    state.profile = result.profile;
+    state.markets = state.markets.map((item) => item.id === market.id ? result.market : item);
+    state.position = result.position || {};
+    state.priceHistoryMarketId = market.id;
+    state.priceHistory = result.market.priceHistory || [];
+    render();
+    showToast(`Sold ${Number(result.soldShares).toFixed(2)} shares for ${formatPoints(result.proceeds)} at the current quote.`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+el.marketList.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-market-id]');
+  if (!button) return;
+  state.selectedId = button.dataset.marketId;
+  state.position = {};
+  state.priceHistory = [];
+  state.priceHistoryMarketId = state.selectedId;
+  render();
+  refreshSelectedMarketData();
+});
+
+el.marketDetail.addEventListener('click', (event) => {
+  const sellButton = event.target.closest('button[data-sell-outcome-id]');
+  if (sellButton) {
+    sellOutcome(sellButton.dataset.sellOutcomeId);
+    return;
+  }
+  const button = event.target.closest('button[data-outcome-id]');
+  if (button) backOutcome(button.dataset.outcomeId);
+});
+
+document.querySelectorAll('.market-tab').forEach((button) => {
+  button.addEventListener('click', () => {
+    state.marketFilter = button.dataset.filter;
+    document.querySelectorAll('.market-tab').forEach((tab) => {
+      const selected = tab === button;
+      tab.classList.toggle('is-selected', selected);
+      tab.setAttribute('aria-pressed', String(selected));
+    });
+    renderMarketList();
+  });
+});
+
+el.search.addEventListener('input', () => {
+  state.search = el.search.value;
+  renderMarketList();
+});
+el.sort.addEventListener('change', () => {
+  state.sort = el.sort.value;
+  renderMarketList();
+});
+
+el.signInButton.addEventListener('click', openAuthDialog);
+el.signOutButton.addEventListener('click', async () => {
+  if (previewMode) return showToast('This is a local sample account. It is not email-verified.');
+  if (!auth) return openAuthDialog();
+  try {
+    await signOut(auth);
+    state.user = null;
+    state.profile = null;
+    state.position = {};
+    render();
+    showToast('Signed out.');
+  } catch { showToast('Could not sign out right now.'); }
+});
+document.querySelector('#nav-create').addEventListener('click', openCreateDialog);
+document.querySelector('#create-market-button').addEventListener('click', openCreateDialog);
+el.authForm.addEventListener('submit', submitAuth);
+el.authToggle.addEventListener('click', () => setAuthMode(state.authMode === 'signin' ? 'signup' : 'signin'));
+document.querySelector('#check-verification').addEventListener('click', checkVerification);
+document.querySelector('#resend-verification').addEventListener('click', resendVerification);
+el.createForm.addEventListener('submit', submitMarket);
+document.querySelectorAll('[data-close-dialog]').forEach((button) => {
+  button.addEventListener('click', () => document.getElementById(button.dataset.closeDialog).close());
+});
+document.querySelectorAll('.modal-dialog').forEach((dialog) => {
+  dialog.addEventListener('click', (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+});
+window.addEventListener('keydown', (event) => {
+  if (event.key === '/' && !event.metaKey && !event.ctrlKey && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
+    event.preventDefault();
+    el.search.focus();
+  }
+});
+
+if (auth) {
+  onAuthStateChanged(auth, async (user) => {
+    if (!user) {
+      state.user = null;
+      state.profile = null;
+      state.position = {};
+      render();
+      return;
+    }
+    state.user = user;
+    if (!user.emailVerified) {
+      state.profile = null;
+      state.position = {};
+      render();
+      return;
+    }
+    await loadProfile(user);
+  });
+}
+
+setAuthMode('signin');
+render();
+refreshMarkets();
